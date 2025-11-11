@@ -1,0 +1,26 @@
+model:
+  provider: torchvision
+  name: resnet18
+  pretrained: true
+  num_classes: 10
+  input_size: 224
+  intermediate:
+    # capture outputs from these internal modules (if present)
+    targets:
+      - layer2.0.relu
+      - layer4.1.relu
+    feature_key: pooler  # ignored for torchvision
+
+training:
+  optimizer: adam
+  lr: 1.0e-3
+  weight_decay: 0.0
+  epochs: 2
+  batch_size: 32
+  device: cuda
+  log_dir: runs/resnet18_exp
+
+data:
+  root: data/images
+  num_workers: 4
+

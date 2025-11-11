@@ -1,0 +1,25 @@
+model:
+  provider: transformers
+  name: google/vit-base-patch16-224
+  pretrained: true
+  num_classes: 10
+  input_size: 224
+  intermediate:
+    # For transformers, targets are dotted module names under the AutoModel
+    targets:
+      - encoder.layer.11.output
+    feature_key: cls  # one of: pooler, cls, mean, last_hidden
+
+training:
+  optimizer: adam
+  lr: 3.0e-4
+  weight_decay: 0.0
+  epochs: 2
+  batch_size: 32
+  device: cuda
+  log_dir: runs/vit_exp
+
+data:
+  root: data/images
+  num_workers: 4
+
