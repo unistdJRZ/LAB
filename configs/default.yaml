@@ -1,0 +1,42 @@
+model:
+  provider: torchvision
+  name: resnet18
+  pretrained: true
+  num_classes: 101
+  input_size: 224
+  intermediate:
+    targets:
+      - layer4.1.relu
+    feature_key: pooler
+    d_source: "target:layer4.1.relu"
+  discriminator:
+    ndf: 128
+    n_layers: 1
+    use_actnorm: false
+
+training:
+  optimizer: adam
+  lr: 1e-3
+  weight_decay: 0.0
+  epochs: 50
+  batch_size: 128
+  g_adv_weight: 0.1
+  d_steps: 5
+  starting_step: 3000
+  d_batch_size: 0
+  d_queue_k: 5
+  device: cuda
+  log_dir: runs
+  task_name: l4b1relu_w0_1_q_5_d128food101
+  wandb: true
+  wandb_project: "ComplexityResearch"
+
+data:
+  source: hf
+  hf_name: "G:/datasets/food101"
+  hf_split: train
+  image_key: image
+  label_key: label
+  mu: 0.5
+  pivot_file: null
+  num_workers: 4

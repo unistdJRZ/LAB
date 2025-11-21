@@ -28,7 +28,7 @@ def capture_intermediates(targets_getter: Callable[[object], List[str]]):
                 for name in targets:
                     module = resolve_module(self.backbone, name)
                     if module is None:
-                        continue
+                        raise ValueError(f"Module '{name}' not found in backbone.")
 
                     def make_hook(nm):
                         def _hook(mod, inp, out):

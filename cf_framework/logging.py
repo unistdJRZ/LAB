@@ -19,18 +19,17 @@ class LossLogger:
         self._fp = open(self._path, "w", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(
             self._fp,
-            fieldnames=["step", "epoch", "loss", "lr"]
+            fieldnames=["step", "epoch", "loss_G", "loss_D", "cls", "g_adv", "lr"]
         )
         if self.write_header:
             self._writer.writeheader()
             self._fp.flush()
 
     def log(self, step: int, epoch: int, loss: float, lr: float, extra: Optional[Dict]=None):
-        row = {"step": step, "epoch": epoch, "loss": float(loss), "lr": float(lr)}
+        # Map provided loss to generator loss for clarity
+        row = {"step": step, "epoch": epoch, "loss_G": float(loss), "lr": float(lr)}
         if extra:
             row.update(extra)
-        # Console
-        print(f"[epoch {epoch} step {step}] loss={loss:.4f} lr={lr:g}")
         # File
         # Ensure writer knows new fields if any
         unknown = [k for k in row.keys() if k not in self._writer.fieldnames]
@@ -44,4 +43,3 @@ class LossLogger:
             self._fp.close()
         except Exception:
             pass
-

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Callable
 import random
 
 import yaml
@@ -35,12 +35,19 @@ class AutoPivoitDataset(Dataset):
         save_pivot: bool = True,
         pivot_dir: Optional[str] = None,
         name: Optional[str] = None,
+        image_key: str = "image",
+        label_key: str = "label",
+        transform: Optional[Callable] = None,
     ) -> None:
         assert 0.0 < mu < 1.0, "mu must be in (0, 1)"
         self.base = base
         self.mu = float(mu)
         self.seed = int(seed)
         self._signs: List[int]
+        # HF-style support
+        self.image_key = image_key
+        self.label_key = label_key
+        self.transform = transform
 
         if pivot_file and os.path.isfile(pivot_file):
             self._load_pivot(pivot_file)
@@ -59,13 +66,27 @@ class AutoPivoitDataset(Dataset):
 
     def __getitem__(self, idx: int):
         item = self.base[idx]
-        # Expect (image, label) structure; pass through extras if present
-        if isinstance(item, tuple) and len(item) >= 2:
-            image, label = item[0], int(item[1])
-            d_bool = bool(self._signs[idx] == 1)
-            return image, label, d_bool
-        # Fallback: unrecognized structure -> return as-is with d_bool
         d_bool = bool(self._signs[idx] == 1)
+        # Case 1: tuple/list like (image, label, ...)
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            image, label = item[0], self._to_int_label(item[1])
+            return image, label, d_bool
+        # Case 2: dict-like sample (e.g., HuggingFace datasets)
+        if isinstance(item, dict) and self.label_key in item:
+            label = self._to_int_label(item[self.label_key])
+            image = item.get(self.image_key, None)
+            # Lazy import PIL only if needed
+            try:
+                from PIL import Image  # type: ignore
+            except Exception:
+                Image = None  # type: ignore
+            # Convert common image types to PIL for transforms
+            if self.transform is not None:
+                if image is not None:
+                    image = self._to_pil(image)
+                    image = self.transform(image)
+            return image, label, d_bool
+        # Fallback: unknown structure; return as-is with boolean
         return item, d_bool
 
     # -- Internals --
@@ -75,15 +96,107 @@ class AutoPivoitDataset(Dataset):
             return list(map(int, getattr(self.base, "targets")))  # type: ignore[arg-type]
         if hasattr(self.base, "labels"):
             return list(map(int, getattr(self.base, "labels")))  # type: ignore[arg-type]
+        # Try HuggingFace datasets column extraction quickly
+        try:
+            # datasets.Dataset supports column access by key
+            col = self.label_key if hasattr(self, "label_key") else "label"
+            labels = self.base[col]  # type: ignore[index]
+            return [self._to_int_label(y) for y in labels]
+        except Exception:
+            pass
         # As a last resort, iterate once (may be slow)
         labels: List[int] = []
         for i in range(len(self.base)):
             item = self.base[i]
-            if isinstance(item, tuple) and len(item) >= 2:
-                labels.append(int(item[1]))
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                labels.append(self._to_int_label(item[1]))
+            elif isinstance(item, dict):
+                key = getattr(self, "label_key", "label")
+                if key in item:
+                    labels.append(self._to_int_label(item[key]))
+                else:
+                    raise RuntimeError("Label key not found in sample dict; set label_key appropriately.")
             else:
                 raise RuntimeError("Unable to infer labels from base dataset; provide a dataset with .targets or (image, label) items.")
         return labels
+
+    def _to_int_label(self, y: Any) -> int:
+        # Prefer ints and bools directly
+        if isinstance(y, bool):
+            return int(y)
+        if isinstance(y, int):
+            return y
+        # Strings: attempt to use HF ClassLabel if present
+        if isinstance(y, str):
+            try:
+                features = getattr(self.base, "features", None)
+                key = getattr(self, "label_key", "label")
+                if features is not None and key in features and hasattr(features[key], "str2int"):
+                    return int(features[key].str2int(y))
+            except Exception:
+                pass
+            # Fallback stable hash mapping (not ideal, but deterministic)
+            return int(abs(hash(y)) % (10**9))
+        # Other numeric types
+        try:
+            return int(y)
+        except Exception:
+            raise TypeError(f"Unsupported label type: {type(y)}")
+
+    def _to_pil(self, img: Any):
+        # Convert common HuggingFace image representations to PIL
+        try:
+            from PIL import Image  # type: ignore
+        except Exception:
+            Image = None  # type: ignore
+        # PIL already
+        if Image is not None:
+            import PIL
+            if isinstance(img, PIL.Image.Image):
+                return img
+        # dict with path or bytes
+        if isinstance(img, dict):
+            if "path" in img and Image is not None:
+                return Image.open(img["path"]).convert("RGB")
+            if "bytes" in img and Image is not None:
+                from io import BytesIO
+                return Image.open(BytesIO(img["bytes"]))
+        # numpy array
+        try:
+            import numpy as np  # type: ignore
+            if isinstance(img, np.ndarray):
+                if Image is None:
+                    return img
+                if img.ndim == 2:
+                    mode = "L"
+                    arr = img
+                elif img.ndim == 3 and img.shape[-1] == 1:
+                    # squeeze single-channel HxWx1 to HxW (L)
+                    mode = "L"
+                    arr = img[..., 0]
+                else:
+                    mode = "RGB"
+                    arr = img
+                return Image.fromarray(arr.astype(np.uint8), mode=mode)
+        except Exception:
+            pass
+        # torch tensor CxHxW
+        try:
+            import torch
+            if isinstance(img, torch.Tensor) and img.dim() == 3 and img.shape[0] in (1, 3):
+                np_img = img.permute(1, 2, 0).contiguous().cpu().numpy()
+                import numpy as np  # type: ignore
+                # If single-channel, squeeze last dim to 2D for 'L'
+                if np_img.shape[-1] == 1:
+                    np_img = np_img[..., 0]
+                    mode = "L"
+                else:
+                    mode = "RGB"
+                np_img = (np_img * 255).astype(np.uint8)
+                return Image.fromarray(np_img, mode=mode) if Image is not None else np_img
+        except Exception:
+            pass
+        return img
 
     @staticmethod
     def _build_balanced_pivot(labels: Sequence[int], mu: float, seed: int) -> List[int]:
@@ -97,7 +210,9 @@ class AutoPivoitDataset(Dataset):
         for y, idxs in by_class.items():
             idxs = list(idxs)
             rng.shuffle(idxs)
-            k_true = int(round(mu * len(idxs)))
+            # Match example logic: use floor via int(len * mu)
+            # rather than rounding, to decide the supervised/pivoted subset size per class.
+            k_true = int(mu * len(idxs))
             # Clamp to [0, len]
             k_true = max(0, min(len(idxs), k_true))
             for i in idxs[:k_true]:
@@ -143,3 +258,39 @@ class AutoPivoitDataset(Dataset):
         self.mu = float(data.get("mu", self.mu))
         self.seed = int(data.get("seed", self.seed))
 
+
+def collate_pivot(batch):
+    """Collate function that ensures 3-channel contiguous tensors and returns
+    (images, labels: LongTensor, d_bool: BoolTensor).
+
+    Placed at package level so it is picklable on Windows when using
+    DataLoader with num_workers > 0.
+    """
+    import torch
+
+    imgs, labels, dbools = [], [], []
+    for sample in batch:
+        if isinstance(sample, (list, tuple)) and len(sample) >= 3:
+            img, y, d = sample[0], sample[1], sample[2]
+        elif isinstance(sample, (list, tuple)) and len(sample) >= 2:
+            img, y = sample[0], sample[1]
+            d = True
+        elif isinstance(sample, dict):
+            img, y = sample.get("image"), sample.get("label", 0)
+            d = sample.get("d", True)
+        else:
+            return torch.utils.data.default_collate(batch)
+        if isinstance(img, torch.Tensor):
+            if img.dim() == 3 and img.shape[0] == 1:
+                img = img.repeat(3, 1, 1)
+            img = img.contiguous()
+        imgs.append(img)
+        labels.append(int(y))
+        dbools.append(bool(d))
+    if all(isinstance(x, torch.Tensor) for x in imgs):
+        images = torch.stack([x.contiguous() for x in imgs], dim=0)
+    else:
+        images = imgs
+    labels_t = torch.tensor(labels, dtype=torch.long)
+    dbools_t = torch.tensor(dbools, dtype=torch.bool)
+    return images, labels_t, dbools_t

@@ -1,16 +1,15 @@
 **Overview**
 - Minimal deep learning experiment framework for image classification.
-- Supports `torchvision` and `transformers` backbones via a single `CFModel`.
+- Single LightningModule `CFModel` builds the backbone and handles training.
+- Supports `torchvision` and `transformers` backbones.
 - Captures differentiable intermediate activations via a decorator and YAML-configured targets.
-- Logs loss to console and CSV via `LossLogger`.
- - Training-only PatchGAN discriminator computes a per-sample score from a configured feature source.
+- Training-only PatchGAN discriminator computes a per-sample score from a configured feature source.
 
 **Key Pieces**
-- `cf_framework/CFModel` builds the backbone and head from YAML.
+- `cf_framework/CFModel` (LightningModule) builds the backbone and head from YAML and implements training.
 - `cf_framework/hooks.py` provides `capture_intermediates` decorator returning `(logits, intermediates)`.
   - In training mode, it returns `(logits, intermediates, d_score)` where `d_score` is the discriminator output.
-- `cf_framework/logging.py` logs losses to CSV in `training.log_dir`.
-- `cf_framework/trainer.py` includes a simple `train_one_epoch` loop.
+- `cf_framework/logging.py` logs losses to CSV in `training.log_dir` (if you want custom CSV logging).
 
 **Config**
 - See `configs/example_torchvision.yaml` (ResNet18) and `configs/example_transformers.yaml` (ViT).
@@ -19,107 +18,50 @@
  - `model.intermediate.d_source`: `"logits"` or `"target:<name>"` to choose the discriminator input feature.
 
 **Usage Sketch**
-- Install dependencies: `torch`, plus `torchvision` and/or `transformers` as needed.
+- Install dependencies: `torch`, `lightning`, plus `torchvision` and/or `transformers` as needed.
 - Create your dataloaders (e.g., using `torchvision.datasets.ImageFolder`).
-- Initialize and train:
+- Initialize Lightning training:
 
 ```
-from cf_framework import CFModel, LossLogger, train_one_epoch
+from cf_framework import CFModel
 from cf_framework.config import Config
-import torch
-from torch import nn
+import lightning as L
+from lightning.pytorch.loggers import CSVLogger
 
 cfg = Config.from_file("configs/example_torchvision.yaml")
-device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
 
-model = CFModel(cfg).to(device)
-
-# Dummy dataset example
-dataset = torch.utils.data.TensorDataset(
-    torch.randn(64, 3, cfg.model.input_size, cfg.model.input_size),
-    torch.randint(0, cfg.model.num_classes, (64,))
-)
-loader = torch.utils.data.DataLoader(dataset, batch_size=cfg.training.batch_size)
-
-optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
-criterion = nn.CrossEntropyLoss()
-logger = LossLogger(cfg.training.log_dir)
-
-for epoch in range(1, cfg.training.epochs + 1):
-    avg_loss = train_one_epoch(model, loader, optimizer, criterion, device, epoch, logger)
-    print("epoch", epoch, "avg_loss", avg_loss)
-
-logger.close()
+module = CFModel(cfg, g_adv_weight=0.1, d_steps=1)
+trainer = L.Trainer(max_epochs=cfg.training.epochs, logger=CSVLogger(cfg.training.log_dir, name="lightning"))
+trainer.fit(module, train_dataloaders=your_train_loader, val_dataloaders=your_val_loader)
 ```
 
 **AutoPivoitDataset Example**
-- Wrap a torchvision dataset to generate reproducible per-class balanced pivots and train G/F vs D adversarially.
+- Wrap a torchvision dataset to generate reproducible per-class balanced pivots; feed to Lightning trainer with `CFModel`.
 
 ```
-from cf_framework import CFModel, LossLogger, train_one_epoch, AutoPivoitDataset
+from cf_framework import CFModel, AutoPivoitDataset
 from cf_framework.config import Config
-import torch
-from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+import lightning as L
+from lightning.pytorch.loggers import CSVLogger
 
 cfg = Config.from_file("configs/example_torchvision.yaml")
-device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
-
-# Base dataset (ImageFolder-style)
 tfm = transforms.Compose([
     transforms.Resize((cfg.model.input_size, cfg.model.input_size)),
     transforms.ToTensor(),
 ])
 base = datasets.ImageFolder(cfg.data.root, transform=tfm)
+loader = DataLoader(AutoPivoitDataset(base, mu=0.5, seed=42, pivot_file="pivots/example.yaml"),
+                    batch_size=cfg.training.batch_size, shuffle=True, num_workers=cfg.data.num_workers)
 
-# Wrap with AutoPivoitDataset to add d_bool (True/False) per-sample
-wrapped = AutoPivoitDataset(base, mu=0.5, seed=42, pivot_file="pivots/example.yaml")
-loader = DataLoader(wrapped, batch_size=cfg.training.batch_size, shuffle=True, num_workers=cfg.data.num_workers)
-
-model = CFModel(cfg).to(device)
-
-# Build G optimizer over model params
-g_optimizer = torch.optim.Adam(model.parameters(), lr=cfg.training.lr, weight_decay=cfg.training.weight_decay)
-criterion = nn.CrossEntropyLoss()
-logger = LossLogger(cfg.training.log_dir)
-
-# Initialize D optimizer by probing a batch to infer discriminator input channels
-first_images, first_y, first_d = next(iter(loader))
-first_images = first_images.to(device)
-model.train()
-with torch.no_grad():
-    out = model(first_images)
-    # Derive D feature the same way trainer does
-    inter = out[1] if (isinstance(out, tuple) and len(out) >= 2 and isinstance(out[1], dict)) else {}
-    d_source = getattr(getattr(model, "model_cfg", None).intermediate, "d_source", "logits").lower()
-    feat = inter.get(d_source.split(":",1)[1]) if d_source.startswith("target:") else (out[0] if isinstance(out, tuple) else out)
-    if feat.dim() == 2: feat = feat.unsqueeze(-1).unsqueeze(-1)
-    if feat.dim() == 3: feat = feat.unsqueeze(-2)
-    in_ch = feat.shape[1]
-disc = model._get_or_init_discriminator(in_ch).to(device)
-d_optimizer = torch.optim.Adam(disc.parameters(), lr=cfg.training.lr)
-
-for epoch in range(1, cfg.training.epochs + 1):
-    avg = train_one_epoch(
-        model,
-        loader,
-        g_optimizer,
-        criterion,
-        device,
-        epoch,
-        logger,
-        d_optimizer=d_optimizer,
-        g_adv_weight=0.1,
-        history_len=64,
-        d_steps=1,
-    )
-    print("epoch", epoch, "avg_loss", avg)
-
-logger.close()
+module = CFModel(cfg, g_adv_weight=0.1, d_steps=1)
+trainer = L.Trainer(max_epochs=cfg.training.epochs, logger=CSVLogger(cfg.training.log_dir, name="lightning"))
+trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
 ```
 
 **CLI Training**
+- If `--config` is not provided, the script loads `configs/default.yaml`.
 - Train from a YAML config and save checkpoints + curves:
 
 ```
@@ -137,9 +79,8 @@ python train.py --config configs/example_torchvision.yaml \
 ```
 
 - Artifacts:
-  - CSV logs: `<log_dir>/loss.csv`
-  - Plots: `<log_dir>/training_curve.png`
-  - Checkpoints: `<ckpt_dir>/epoch_*.pt`, `last.pt`, `best.pt`
+  - Lightning logs in `<log_dir>/lightning` (CSV if using CSVLogger)
+  - Checkpoints via Lightning callback
 
 **Intermediate Activations**
 - The model's `forward` is wrapped by a decorator that registers temporary forward hooks on modules listed under `model.intermediate.targets`.
